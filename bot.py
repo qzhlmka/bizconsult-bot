@@ -7,14 +7,18 @@ from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+import stripe
 from openai import AsyncOpenAI
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 openai_client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID", "price_1TOYrbH9QKaRQPiwmvMXOla1")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 
-FREE_QUERIES_PER_DAY = 100
+FREE_QUERIES_PER_DAY = 3
 
 SYSTEM_PROMPT = f"""You are an elite business consultant with 20+ years of experience advising Fortune 500 companies and high-growth startups. You provide expert, actionable guidance on:
 
@@ -26,7 +30,7 @@ SYSTEM_PROMPT = f"""You are an elite business consultant with 20+ years of exper
 - Legal & HR: Business structures, equity, compliance, hiring (general guidance only)
 - AI Monetization: Building and monetizing AI-powered products, subscription models for AI tools, usage-based pricing, freemium strategies, deploying AI bots (Telegram, WhatsApp, web), integrating OpenAI/Claude APIs into paid products, reducing API costs, acquiring users for AI products, and scaling AI SaaS businesses
 
-This bot operates on a freemium model. Users get {FREE_QUERIES_PER_DAY} free queries per day. Once they hit the limit, they are informed they need to upgrade to continue. If a user asks about the limit, pricing, or how to get more queries, let them know they get {FREE_QUERIES_PER_DAY} free queries per day and to contact the bot owner to upgrade.
+This bot operates on a freemium model. Free users get {FREE_QUERIES_PER_DAY} free queries per day. Pro users get unlimited queries. If a user asks about the limit, pricing, or how to get more queries, let them know they can upgrade to Pro for unlimited access using /upgrade.
 
 Be direct and specific. Prioritize the 2-3 highest-leverage actions. Ask one clarifying question when context is insufficient. Always acknowledge tradeoffs."""
 
@@ -38,7 +42,10 @@ def init_db():
             chat_id INTEGER PRIMARY KEY,
             queries_today INTEGER DEFAULT 0,
             last_query_date TEXT,
-            history TEXT DEFAULT '[]'
+            history TEXT DEFAULT '[]',
+            subscription_status TEXT DEFAULT 'free',
+            stripe_customer_id TEXT,
+            subscription_id TEXT
         )
     """)
     conn.commit()
@@ -53,7 +60,11 @@ def get_user(chat_id: int) -> Optional[dict]:
     conn.close()
     if not row:
         return None
-    return {"chat_id": row[0], "queries_today": row[1], "last_query_date": row[2], "history": json.loads(row[3])}
+    cols = ["chat_id", "queries_today", "last_query_date", "history",
+            "subscription_status", "stripe_customer_id", "subscription_id"]
+    d = dict(zip(cols, row))
+    d["history"] = json.loads(d["history"])
+    return d
 
 
 def upsert_user(chat_id: int, **kwargs):
@@ -73,6 +84,9 @@ def check_and_increment_quota(chat_id: int) -> tuple[bool, int]:
         upsert_user(chat_id)
         user = get_user(chat_id)
 
+    if user["subscription_status"] == "active":
+        return True, -1  # unlimited
+
     today = datetime.now().strftime("%Y-%m-%d")
     if user["last_query_date"] != today:
         upsert_user(chat_id, queries_today=0, last_query_date=today)
@@ -89,11 +103,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Welcome to *BizConsult AI* — your expert business advisor!\n\n"
         "Ask me anything about strategy, finance, marketing, operations, or fundraising.\n\n"
-        f"You get *{FREE_QUERIES_PER_DAY} free queries per day*.\n\n"
+        f"You get *{FREE_QUERIES_PER_DAY} free queries per day*. Upgrade to Pro for unlimited access.\n\n"
         "Commands:\n"
         "/start — Welcome message\n"
         "/reset — Clear conversation history\n"
-        "/status — Check your daily quota",
+        "/status — Check your daily quota\n"
+        "/upgrade — Upgrade to Pro (unlimited queries)",
         parse_mode="Markdown",
     )
 
@@ -113,14 +128,60 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     today = datetime.now().strftime("%Y-%m-%d")
     queries_today = user["queries_today"] if user["last_query_date"] == today else 0
-    remaining = max(0, FREE_QUERIES_PER_DAY - queries_today)
 
-    await update.message.reply_text(
-        f"📊 *Your Usage Today*\n\n"
-        f"Queries used: {queries_today}/{FREE_QUERIES_PER_DAY}\n"
-        f"Remaining: {remaining}",
-        parse_mode="Markdown",
-    )
+    if user["subscription_status"] == "active":
+        await update.message.reply_text(
+            "📊 *Your Status*\n\n✅ Pro — Unlimited queries",
+            parse_mode="Markdown",
+        )
+    else:
+        remaining = max(0, FREE_QUERIES_PER_DAY - queries_today)
+        await update.message.reply_text(
+            f"📊 *Your Status*\n\n"
+            f"Plan: Free\n"
+            f"Queries used today: {queries_today}/{FREE_QUERIES_PER_DAY}\n"
+            f"Remaining: {remaining}\n\n"
+            f"Use /upgrade for unlimited access.",
+            parse_mode="Markdown",
+        )
+
+
+async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user = get_user(chat_id)
+
+    if user and user["subscription_status"] == "active":
+        await update.message.reply_text("✅ You're already on Pro — unlimited queries!")
+        return
+
+    if not stripe.api_key:
+        await update.message.reply_text("Payment not configured yet. Please contact the owner.")
+        return
+
+    try:
+        params = {
+            "payment_method_types": ["card"],
+            "line_items": [{"price": STRIPE_PRICE_ID, "quantity": 1}],
+            "mode": "subscription",
+            "success_url": "https://t.me/" + (await context.bot.get_me()).username + "?start=success",
+            "cancel_url": "https://t.me/" + (await context.bot.get_me()).username,
+            "metadata": {"chat_id": str(chat_id)},
+        }
+        if user and user.get("stripe_customer_id"):
+            params["customer"] = user["stripe_customer_id"]
+
+        session = stripe.checkout.Session.create(**params)
+
+        keyboard = [[InlineKeyboardButton("💳 Pay & Upgrade to Pro", url=session.url)]]
+        await update.message.reply_text(
+            "🚀 *Upgrade to Pro*\n\n"
+            "Get unlimited queries for RM10/month.\n\n"
+            "Click the button below to complete payment:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Error creating payment link: {e}")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -129,9 +190,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     allowed, remaining = check_and_increment_quota(chat_id)
     if not allowed:
+        keyboard = [[InlineKeyboardButton("💳 Upgrade to Pro", callback_data="upgrade")]]
         await update.message.reply_text(
-            f"⚠️ You've used all {FREE_QUERIES_PER_DAY} free queries for today.\n"
-            "Come back tomorrow for more!"
+            f"⚠️ You've used all {FREE_QUERIES_PER_DAY} free queries for today.\n\n"
+            "Upgrade to Pro for unlimited access — RM10/month.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
         )
         return
 
@@ -160,12 +223,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history.append({"role": "assistant", "content": reply})
     upsert_user(chat_id, history=history[-20:])
 
-    # Split if reply exceeds Telegram's 4096 char limit
     for i in range(0, len(reply), 4096):
         await update.message.reply_text(reply[i:i+4096])
 
     if remaining > 0:
-        await update.message.reply_text(f"_{remaining} queries remaining today_", parse_mode="Markdown")
+        await update.message.reply_text(f"_{remaining} free queries remaining today_", parse_mode="Markdown")
+    elif remaining == 0:
+        keyboard = [[InlineKeyboardButton("💳 Upgrade to Pro", callback_data="upgrade")]]
+        await update.message.reply_text(
+            "_That was your last free query today. Upgrade to Pro for unlimited access._",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "upgrade":
+        await upgrade(update, context)
 
 
 def main():
@@ -174,6 +250,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("upgrade", upgrade))
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("Bot is running... Press Ctrl+C to stop.")

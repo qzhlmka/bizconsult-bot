@@ -27,7 +27,7 @@ supabase: Client = create_client(
     os.environ["SUPABASE_KEY"],
 )
 
-FREE_QUERIES_PER_DAY = 3
+FREE_QUERIES_PER_DAY = 10
 
 SYSTEM_PROMPT = f"""You are an elite business consultant with 20+ years of experience advising Fortune 500 companies and high-growth startups. You provide expert, actionable guidance on:
 

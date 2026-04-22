@@ -2,3 +2,6 @@ openai==1.54.0
 python-telegram-bot==21.6
 stripe==11.1.0
 httpx==0.27.2
+fastapi==0.115.5
+uvicorn==0.32.1
+supabase==1.2.0

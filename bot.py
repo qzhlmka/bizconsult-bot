@@ -1,15 +1,19 @@
 import os
 import json
-import sqlite3
 import logging
+import asyncio
+import threading
 from typing import Optional
 from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 import stripe
+import uvicorn
+from fastapi import FastAPI, Request, HTTPException
 from openai import AsyncOpenAI
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from supabase import create_client, Client
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 openai_client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
@@ -17,6 +21,11 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID", "price_1TOYrbH9QKaRQPiwmvMXOla1")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+
+supabase: Client = create_client(
+    os.environ["SUPABASE_URL"],
+    os.environ["SUPABASE_KEY"],
+)
 
 FREE_QUERIES_PER_DAY = 3
 
@@ -35,47 +44,24 @@ This bot operates on a freemium model. Free users get {FREE_QUERIES_PER_DAY} fre
 Be direct and specific. Prioritize the 2-3 highest-leverage actions. Ask one clarifying question when context is insufficient. Always acknowledge tradeoffs."""
 
 
-def init_db():
-    conn = sqlite3.connect("consultant.db")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            chat_id INTEGER PRIMARY KEY,
-            queries_today INTEGER DEFAULT 0,
-            last_query_date TEXT,
-            history TEXT DEFAULT '[]',
-            subscription_status TEXT DEFAULT 'free',
-            stripe_customer_id TEXT,
-            subscription_id TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-
 def get_user(chat_id: int) -> Optional[dict]:
-    conn = sqlite3.connect("consultant.db")
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,))
-    row = c.fetchone()
-    conn.close()
-    if not row:
+    res = supabase.table("users").select("*").eq("chat_id", chat_id).execute()
+    if not res.data:
         return None
-    cols = ["chat_id", "queries_today", "last_query_date", "history",
-            "subscription_status", "stripe_customer_id", "subscription_id"]
-    d = dict(zip(cols, row))
-    d["history"] = json.loads(d["history"])
+    d = res.data[0]
+    if isinstance(d["history"], str):
+        d["history"] = json.loads(d["history"])
     return d
 
 
 def upsert_user(chat_id: int, **kwargs):
-    conn = sqlite3.connect("consultant.db")
-    conn.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,))
-    for key, val in kwargs.items():
-        if key == "history":
-            val = json.dumps(val)
-        conn.execute(f"UPDATE users SET {key} = ? WHERE chat_id = ?", (val, chat_id))
-    conn.commit()
-    conn.close()
+    user = get_user(chat_id)
+    if kwargs.get("history") is not None and not isinstance(kwargs["history"], str):
+        kwargs["history"] = json.dumps(kwargs["history"])
+    if not user:
+        supabase.table("users").insert({"chat_id": chat_id, **kwargs}).execute()
+    else:
+        supabase.table("users").update(kwargs).eq("chat_id", chat_id).execute()
 
 
 def check_and_increment_quota(chat_id: int) -> tuple[bool, int]:
@@ -85,7 +71,7 @@ def check_and_increment_quota(chat_id: int) -> tuple[bool, int]:
         user = get_user(chat_id)
 
     if user["subscription_status"] == "active":
-        return True, -1  # unlimited
+        return True, -1
 
     today = datetime.now().strftime("%Y-%m-%d")
     if user["last_query_date"] != today:
@@ -99,18 +85,68 @@ def check_and_increment_quota(chat_id: int) -> tuple[bool, int]:
     return True, FREE_QUERIES_PER_DAY - user["queries_today"] - 1
 
 
+# FastAPI for Stripe webhook
+web = FastAPI()
+
+@web.post("/webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature", "")
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    bot = Bot(token=TELEGRAM_TOKEN)
+
+    if event["type"] == "checkout.session.completed":
+        s = event["data"]["object"]
+        chat_id = s["metadata"].get("chat_id")
+        if chat_id:
+            chat_id = int(chat_id)
+            upsert_user(chat_id,
+                        stripe_customer_id=s.get("customer"),
+                        subscription_id=s.get("subscription"),
+                        subscription_status="active")
+            await bot.send_message(chat_id=chat_id,
+                                   text="✅ Payment successful! You're now on *Pro* — unlimited queries!",
+                                   parse_mode="Markdown")
+
+    elif event["type"] in ("customer.subscription.deleted", "customer.subscription.updated"):
+        sub = event["data"]["object"]
+        status = "active" if sub["status"] == "active" else "free"
+        supabase.table("users").update({"subscription_status": status}).eq("subscription_id", sub["id"]).execute()
+
+    return {"ok": True}
+
+
+# Telegram handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Welcome to *BizConsult AI* — your expert business advisor!\n\n"
-        "Ask me anything about strategy, finance, marketing, operations, or fundraising.\n\n"
-        f"You get *{FREE_QUERIES_PER_DAY} free queries per day*. Upgrade to Pro for unlimited access.\n\n"
-        "Commands:\n"
-        "/start — Welcome message\n"
-        "/reset — Clear conversation history\n"
-        "/status — Check your daily quota\n"
-        "/upgrade — Upgrade to Pro (unlimited queries)",
-        parse_mode="Markdown",
-    )
+    chat_id = update.effective_chat.id
+    user = get_user(chat_id)
+
+    if user and user["subscription_status"] == "active":
+        await update.message.reply_text(
+            "✅ You're on *Pro* — unlimited queries!\n\n"
+            "Ask me anything about strategy, finance, marketing, operations, or fundraising.\n\n"
+            "Commands:\n"
+            "/reset — Clear conversation history\n"
+            "/status — Check your plan",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            "👋 Welcome to *BizConsult AI* — your expert business advisor!\n\n"
+            "Ask me anything about strategy, finance, marketing, operations, or fundraising.\n\n"
+            f"You get *{FREE_QUERIES_PER_DAY} free queries per day*. Upgrade to Pro for unlimited access.\n\n"
+            "Commands:\n"
+            "/start — Welcome message\n"
+            "/reset — Clear conversation history\n"
+            "/status — Check your daily quota\n"
+            "/upgrade — Upgrade to Pro (unlimited queries)",
+            parse_mode="Markdown",
+        )
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -171,7 +207,6 @@ async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             params["customer"] = user["stripe_customer_id"]
 
         session = stripe.checkout.Session.create(**params)
-
         keyboard = [[InlineKeyboardButton("💳 Pay & Upgrade to Pro", url=session.url)]]
         await update.message.reply_text(
             "🚀 *Upgrade to Pro*\n\n"
@@ -226,15 +261,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i in range(0, len(reply), 4096):
         await update.message.reply_text(reply[i:i+4096])
 
-    if remaining > 0:
-        await update.message.reply_text(f"_{remaining} free queries remaining today_", parse_mode="Markdown")
-    elif remaining == 0:
+    if remaining == 0:
         keyboard = [[InlineKeyboardButton("💳 Upgrade to Pro", callback_data="upgrade")]]
         await update.message.reply_text(
             "_That was your last free query today. Upgrade to Pro for unlimited access._",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
+    elif remaining > 0:
+        await update.message.reply_text(f"_{remaining} free queries remaining today_", parse_mode="Markdown")
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -244,8 +279,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await upgrade(update, context)
 
 
+def run_web():
+    uvicorn.run(web, host="0.0.0.0", port=8000, log_level="warning", loop="none")
+
+
 def main():
-    init_db()
+    # Run FastAPI in background thread
+    thread = threading.Thread(target=run_web, daemon=True)
+    thread.daemon = True
+    thread.start()
+    import time; time.sleep(1)
+    print("Webhook server running on port 8000")
+
+    # Run Telegram bot
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))

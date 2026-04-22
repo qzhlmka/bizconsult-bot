@@ -5,6 +5,9 @@ import asyncio
 import threading
 from typing import Optional
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+MY_TZ = ZoneInfo("Asia/Kuala_Lumpur")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -73,7 +76,7 @@ def check_and_increment_quota(chat_id: int) -> tuple[bool, int]:
     if user["subscription_status"] == "active":
         return True, -1
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(MY_TZ).strftime("%Y-%m-%d")
     if user["last_query_date"] != today:
         upsert_user(chat_id, queries_today=0, last_query_date=today)
         user["queries_today"] = 0
@@ -122,9 +125,13 @@ async def stripe_webhook(request: Request):
 
     elif event["type"] == "customer.subscription.deleted":
         sub = event["data"]["object"]
+        end_ts = sub.get("ended_at") or sub.get("current_period_end")
+        today = datetime.now(MY_TZ).strftime("%Y-%m-%d")
         updates = {
             "subscription_status": "free",
-            "subscription_end": datetime.utcfromtimestamp(sub["current_period_end"]).isoformat(),
+            "subscription_end": datetime.utcfromtimestamp(end_ts).isoformat() if end_ts else None,
+            "queries_today": 0,
+            "last_query_date": today,
         }
         supabase.table("users").update(updates).eq("subscription_id", sub["id"]).execute()
         res = supabase.table("users").select("chat_id").eq("subscription_id", sub["id"]).execute()
@@ -212,7 +219,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         upsert_user(chat_id)
         user = get_user(chat_id)
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(MY_TZ).strftime("%Y-%m-%d")
     queries_today = user["queries_today"] if user["last_query_date"] == today else 0
 
     if user["subscription_status"] == "active":

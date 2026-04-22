@@ -105,18 +105,67 @@ async def stripe_webhook(request: Request):
         chat_id = s["metadata"].get("chat_id")
         if chat_id:
             chat_id = int(chat_id)
-            upsert_user(chat_id,
-                        stripe_customer_id=s.get("customer"),
-                        subscription_id=s.get("subscription"),
-                        subscription_status="active")
+            sub_id = s.get("subscription")
+            updates = {
+                "stripe_customer_id": s.get("customer"),
+                "subscription_id": sub_id,
+                "subscription_status": "active",
+            }
+            if sub_id:
+                sub = stripe.Subscription.retrieve(sub_id)
+                updates["subscription_start"] = datetime.utcfromtimestamp(sub["current_period_start"]).isoformat()
+                updates["subscription_end"] = datetime.utcfromtimestamp(sub["current_period_end"]).isoformat()
+            upsert_user(chat_id, **updates)
             await bot.send_message(chat_id=chat_id,
                                    text="✅ Payment successful! You're now on *Pro* — unlimited queries!",
                                    parse_mode="Markdown")
 
-    elif event["type"] in ("customer.subscription.deleted", "customer.subscription.updated"):
+    elif event["type"] == "customer.subscription.deleted":
+        sub = event["data"]["object"]
+        updates = {
+            "subscription_status": "free",
+            "subscription_end": datetime.utcfromtimestamp(sub["current_period_end"]).isoformat(),
+        }
+        supabase.table("users").update(updates).eq("subscription_id", sub["id"]).execute()
+        res = supabase.table("users").select("chat_id").eq("subscription_id", sub["id"]).execute()
+        if res.data:
+            await bot.send_message(
+                chat_id=res.data[0]["chat_id"],
+                text=(
+                    "😔 Your *Pro* subscription has ended.\n\n"
+                    f"You're now back to *{FREE_QUERIES_PER_DAY} free queries per day*.\n\n"
+                    "Use /upgrade anytime to resubscribe and get unlimited access again."
+                ),
+                parse_mode="Markdown",
+            )
+
+    elif event["type"] == "customer.subscription.updated":
         sub = event["data"]["object"]
         status = "active" if sub["status"] == "active" else "free"
-        supabase.table("users").update({"subscription_status": status}).eq("subscription_id", sub["id"]).execute()
+        updates = {
+            "subscription_status": status,
+            "subscription_end": datetime.utcfromtimestamp(sub["current_period_end"]).isoformat(),
+        }
+        if status == "active":
+            updates["subscription_start"] = datetime.utcfromtimestamp(sub["current_period_start"]).isoformat()
+        supabase.table("users").update(updates).eq("subscription_id", sub["id"]).execute()
+
+    elif event["type"] == "invoice.payment_failed":
+        invoice = event["data"]["object"]
+        sub_id = invoice.get("subscription")
+        if sub_id:
+            res = supabase.table("users").select("chat_id").eq("subscription_id", sub_id).execute()
+            if res.data:
+                attempt = invoice.get("attempt_count", 1)
+                await bot.send_message(
+                    chat_id=res.data[0]["chat_id"],
+                    text=(
+                        f"⚠️ *Payment failed* (attempt {attempt}).\n\n"
+                        "We couldn't charge your card. Please update your payment method to keep your *Pro* access.\n\n"
+                        "Use /upgrade to re-enter your payment details."
+                    ),
+                    parse_mode="Markdown",
+                )
 
     return {"ok": True}
 
@@ -132,7 +181,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Ask me anything about strategy, finance, marketing, operations, or fundraising.\n\n"
             "Commands:\n"
             "/reset — Clear conversation history\n"
-            "/status — Check your plan",
+            "/status — Check your plan\n"
+            "/cancel — Cancel your subscription",
             parse_mode="Markdown",
         )
     else:
@@ -219,6 +269,31 @@ async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Error creating payment link: {e}")
 
 
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user = get_user(chat_id)
+
+    if not user or user["subscription_status"] != "active":
+        await update.message.reply_text("You don't have an active Pro subscription.")
+        return
+
+    if not user.get("subscription_id"):
+        await update.message.reply_text("No subscription found. Please contact support.")
+        return
+
+    try:
+        sub = stripe.Subscription.modify(user["subscription_id"], cancel_at_period_end=True)
+        end_date = datetime.utcfromtimestamp(sub["current_period_end"]).strftime("%d %b %Y")
+        await update.message.reply_text(
+            f"✅ Your subscription has been cancelled.\n\n"
+            f"You'll keep *Pro* access until *{end_date}*, then revert to {FREE_QUERIES_PER_DAY} free queries/day.\n\n"
+            "Changed your mind? Use /upgrade to resubscribe.",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Failed to cancel subscription: {e}")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = update.message.text
@@ -297,6 +372,7 @@ def main():
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("upgrade", upgrade))
+    app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 

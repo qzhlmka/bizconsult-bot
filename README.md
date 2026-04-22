@@ -6,7 +6,7 @@ An AI-powered business consultant chatbot that runs on Telegram, powered by Open
 
 - Answers business questions via Telegram chat
 - Remembers conversation history per user (last 20 messages)
-- Freemium model — 3 free queries/day, unlimited for Pro users
+- Freemium model — 10 free queries/day, unlimited for Pro users
 - Stripe payment integration — RM10/month subscription
 - Resets the query count automatically every day
 - Stores all data in Supabase (PostgreSQL cloud database)
@@ -15,10 +15,11 @@ An AI-powered business consultant chatbot that runs on Telegram, powered by Open
 
 - **GPT-4o powered** — intelligent, context-aware business advice
 - **Conversation memory** — remembers the context of your chat
-- **Daily quota** — 3 free queries per user per day
+- **Daily quota** — 10 free queries per user per day
 - **Stripe payments** — users can upgrade to Pro via `/upgrade`
 - **Supabase database** — cloud storage for users and subscriptions
-- **Simple commands** — `/start`, `/reset`, `/status`, `/upgrade`
+- **Simple commands** — `/start`, `/reset`, `/status`, `/upgrade`, `/cancel`
+- **Subscription lifecycle** — auto-notifies users on payment failure, cancellation, and plan expiry
 
 ## File Structure
 
@@ -75,14 +76,29 @@ stripe listen --forward-to localhost:8000/webhook
 | `/reset` | Clear your conversation history |
 | `/status` | Check your plan and daily quota |
 | `/upgrade` | Upgrade to Pro — unlimited queries for RM10/month |
+| `/cancel` | Cancel your Pro subscription (access kept until period ends) |
+
+## Stripe Webhook Events
+
+The bot listens for these Stripe events at `/webhook`:
+
+| Event | Action |
+|-------|--------|
+| `checkout.session.completed` | Activates Pro, saves subscription dates |
+| `customer.subscription.updated` | Updates subscription start/end dates on renewal |
+| `customer.subscription.deleted` | Downgrades user to free, notifies via Telegram |
+| `invoice.payment_failed` | Warns user via Telegram with retry count |
 
 ## Deploying to Railway
 
 1. Push this repo to GitHub
 2. Go to [railway.app](https://railway.app) → New Project → Deploy from GitHub
 3. Add all environment variables in the Railway dashboard
-4. Set start command to `python bot.py`
-5. Deploy — your bot runs 24/7
+4. Deploy — your bot runs 24/7
+5. Go to Stripe Dashboard → **Developers** → **Webhooks** → **Add endpoint**
+   - URL: `https://your-app.railway.app/webhook`
+   - Events: `checkout.session.completed`, `customer.subscription.updated`, `customer.subscription.deleted`, `invoice.payment_failed`
+6. Copy the webhook signing secret into Railway as `STRIPE_WEBHOOK_SECRET`
 
 ## Environment Variables
 

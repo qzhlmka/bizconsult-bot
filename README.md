@@ -6,28 +6,29 @@ An AI-powered business consultant chatbot that runs on Telegram, powered by Open
 
 - Answers business questions via Telegram chat
 - Remembers conversation history per user (last 20 messages)
-- Limits free users to 100 queries per day
+- Freemium model — 3 free queries/day, unlimited for Pro users
+- Stripe payment integration — RM10/month subscription
 - Resets the query count automatically every day
-- Stores all data locally in a SQLite database
+- Stores all data in Supabase (PostgreSQL cloud database)
 
 ## Features
 
 - **GPT-4o powered** — intelligent, context-aware business advice
 - **Conversation memory** — remembers the context of your chat
-- **Daily quota** — 100 free queries per user per day
-- **Simple commands** — `/start`, `/reset`, `/status`
+- **Daily quota** — 3 free queries per user per day
+- **Stripe payments** — users can upgrade to Pro via `/upgrade`
+- **Supabase database** — cloud storage for users and subscriptions
+- **Simple commands** — `/start`, `/reset`, `/status`, `/upgrade`
 
 ## File Structure
 
 ```
 consultant_bot/
-├── bot.py              # Main bot logic — handles Telegram messages, quota tracking, and OpenAI calls
+├── bot.py              # Main bot logic — Telegram, OpenAI, Stripe webhook, Supabase
 ├── requirements.txt    # Python dependencies
 ├── Procfile            # Tells Railway how to run the bot (worker: python bot.py)
-├── .env.example        # Template for environment variables (copy to .env and fill in your keys)
-├── .gitignore          # Excludes .env, database, and cache files from Git
-└── static/
-    └── index.html      # Web UI (not used in Telegram-only mode)
+├── .env.example        # Template for environment variables
+└── .gitignore          # Excludes .env and cache files from Git
 ```
 
 ## Setup
@@ -50,10 +51,20 @@ cp .env.example .env
 Fill in your keys in `.env`:
 - `OPENAI_API_KEY` — get from [platform.openai.com](https://platform.openai.com)
 - `TELEGRAM_BOT_TOKEN` — get from [@BotFather](https://t.me/BotFather) on Telegram
+- `STRIPE_SECRET_KEY` — get from [dashboard.stripe.com/apikeys](https://dashboard.stripe.com/apikeys)
+- `STRIPE_PRICE_ID` — your subscription price ID from Stripe dashboard
+- `STRIPE_WEBHOOK_SECRET` — from Stripe CLI (`stripe listen`)
+- `SUPABASE_URL` — your Supabase project URL
+- `SUPABASE_KEY` — your Supabase anon key
 
 ### 4. Run locally
 ```bash
-OPENAI_API_KEY=your-key TELEGRAM_BOT_TOKEN=your-token python bot.py
+export $(cat .env | xargs) && python bot.py
+```
+
+### 5. Forward Stripe webhooks locally (in a second terminal)
+```bash
+stripe listen --forward-to localhost:8000/webhook
 ```
 
 ## Telegram Commands
@@ -62,13 +73,14 @@ OPENAI_API_KEY=your-key TELEGRAM_BOT_TOKEN=your-token python bot.py
 |---------|-------------|
 | `/start` | Welcome message and instructions |
 | `/reset` | Clear your conversation history |
-| `/status` | Check how many queries you have left today |
+| `/status` | Check your plan and daily quota |
+| `/upgrade` | Upgrade to Pro — unlimited queries for RM10/month |
 
 ## Deploying to Railway
 
 1. Push this repo to GitHub
 2. Go to [railway.app](https://railway.app) → New Project → Deploy from GitHub
-3. Add environment variables (`OPENAI_API_KEY`, `TELEGRAM_BOT_TOKEN`) in the Railway dashboard
+3. Add all environment variables in the Railway dashboard
 4. Set start command to `python bot.py`
 5. Deploy — your bot runs 24/7
 
@@ -78,3 +90,8 @@ OPENAI_API_KEY=your-key TELEGRAM_BOT_TOKEN=your-token python bot.py
 |----------|-------------|
 | `OPENAI_API_KEY` | Your OpenAI API key |
 | `TELEGRAM_BOT_TOKEN` | Your Telegram bot token from BotFather |
+| `STRIPE_SECRET_KEY` | Your Stripe secret key |
+| `STRIPE_PRICE_ID` | Your Stripe subscription price ID |
+| `STRIPE_WEBHOOK_SECRET` | Webhook secret from Stripe CLI or dashboard |
+| `SUPABASE_URL` | Your Supabase project URL |
+| `SUPABASE_KEY` | Your Supabase anon key |
